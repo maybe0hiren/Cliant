@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+
+import os
+from dotenv import load_dotenv
+from google import genai
+
+load_dotenv()
+LLM = os.getenv("GEMINI_KEY")
+if not LLM:
+    raise RuntimeError("LLM not reachable")
+client = genai.Client(api_key=LLM)
+modelName = "models/gemini-2.5-flash"
+
+def llmInteraction(task):
+    specs = os.getenv("SPECS")
+    prompt = f"""
+            You are a master in Arch Linux command line.
+            These are my device specifications:
+            {specs}
+            Give me the command for this task:
+            {task}
+            Only output the command
+        """ 
+    response = client.models.generate_content(
+        model=modelName,
+        contents=prompt,
+    )
+    return response.text.strip()
+
+
+def main():
+    try:
+        while True:
+            task = input("> ")
+            command = llmInteraction(task)
+            print(command)            
+    except KeyboardInterrupt:
+        print("\nTerminated...")
+
+
+if __name__  == "__main__":
+    main() 
