@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+#!<PROJECT DIRECTORY>/Cliant/env/bin/python
 
 import os
 from dotenv import load_dotenv
 from google import genai
 
+#Code Setup
 load_dotenv()
 LLM = os.getenv("GEMINI_KEY")
 if not LLM:
@@ -11,6 +12,23 @@ if not LLM:
 client = genai.Client(api_key=LLM)
 modelName = "models/gemini-2.5-flash"
 
+#Get relevant system information
+def getReqSysInfo(userMessage):
+    prompt = f"""
+            You are a decent experience user of Arch Linux System.
+            The user wants to execute a task in the CLI.
+            Here is the task {userMessage}
+            Tell me the system information required generate the command to execute the task
+            Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
+            Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
+        """ 
+    response = client.models.generate_content(
+        model=modelName,
+        contents=prompt,
+    )
+    return response.text.strip()    
+
+#Change the specs retrieval/fetching
 def llmInteraction(task):
     specs = os.getenv("SPECS")
     prompt = f"""
@@ -32,7 +50,7 @@ def main():
     try:
         while True:
             task = input("> ")
-            command = llmInteraction(task)
+            command = getReqSysInfo(task)
             print(command)            
     except KeyboardInterrupt:
         print("\nTerminated...")
