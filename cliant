@@ -1,8 +1,9 @@
-#!<PROJECT DIRECTORY>/Cliant/env/bin/python
+#!<PATH>/Cliant/env/bin/python
 
 import os
 from dotenv import load_dotenv
 from google import genai
+import json
 
 #Code Setup
 load_dotenv()
@@ -11,6 +12,13 @@ if not LLM:
     raise RuntimeError("LLM not reachable")
 client = genai.Client(api_key=LLM)
 modelName = "models/gemini-2.5-flash"
+
+def askLLM(prompt):
+    response = client.models.generate_content(
+        model=modelName,
+        contents=prompt,
+    )
+    return response.text.strip()    
 
 #Get relevant system information
 def getReqSysInfo(userMessage):
@@ -21,30 +29,38 @@ def getReqSysInfo(userMessage):
             Tell me the system information required generate the command to execute the task
             Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
             Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
-        """ 
-    response = client.models.generate_content(
-        model=modelName,
-        contents=prompt,
-    )
-    return response.text.strip()    
+            If you need info abou these, OS, Kernel, CPU Architecture, RAM, Package Manager, Desktop Environmet, Boot Mode... Use these exact words only
+            If you need any extra info, state that too 
+        """
+    reqSysInfo = askLLM(prompt)
+    reqSysInfo = reqSysInfo.split(",")
+    return reqSysInfo
 
-#Change the specs retrieval/fetching
-def llmInteraction(task):
-    specs = os.getenv("SPECS")
+
+#Get the required system info
+def retrieveSysInfo(reqSysInfo):
+    #Retrieve from the saved data
+    sysInfo = {}
+    with open("sysInfo.json") as f:
+        data = json.load(f)
+    for info in reqSysInfo[:]:
+        if info in data:
+            sysInfo[info] = data[info]
+            reqSysInfo.remove(info)
+    
+    #Fetch the remaining info from the system
     prompt = f"""
-            You are a master in Arch Linux command line.
-            These are my device specifications:
-            {specs}
-            Give me the command for this task:
-            {task}
-            Only output the command
-        """ 
-    response = client.models.generate_content(
-        model=modelName,
-        contents=prompt,
-    )
-    return response.text.strip()
-
+            You are a decent experience user of Arch Linux System.
+            Here's s list of system information I want.
+            {",".join(reqSysInfo)}.
+            Give me all the commands required to fetch this info.
+            If there are multiple commands to retrieve the same info, use the one which generates the least noise.
+            But I dont want any options to choose from, make the decision and give me the command.
+            Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
+            Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
+        """
+    commands = askLLM(prompt)
+    commands = commands.split(",")
 
 def main():
     try:
@@ -57,4 +73,6 @@ def main():
 
 
 if __name__  == "__main__":
+    reqSysInfo = ["Boot Mode", "RAM", "Network Manager", "nodejs version"]
+    retrieveSysInfo(reqSysInfo)
     main() 
