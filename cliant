@@ -1,9 +1,10 @@
-#!<PATH>/Cliant/env/bin/python
+#!/<PATH>/Cliant/env/bin/python
 
 import os
 from dotenv import load_dotenv
 from google import genai
 import json
+import subprocess
 
 #Code Setup
 load_dotenv()
@@ -29,8 +30,9 @@ def getReqSysInfo(userMessage):
             Tell me the system information required generate the command to execute the task
             Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
             Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
-            If you need info abou these, OS, Kernel, CPU Architecture, RAM, Package Manager, Desktop Environmet, Boot Mode... Use these exact words only
-            If you need any extra info, state that too 
+            If you need info about these, OS, Kernel, CPU Architecture, RAM, Package Manager, Desktop Environmet, Boot Mode... Use these exact words only 
+            Ask for them only if its really necessary
+            If you need any extra info, state that too but dont mention what info is extra.
         """
     reqSysInfo = askLLM(prompt)
     reqSysInfo = reqSysInfo.split(",")
@@ -58,9 +60,46 @@ def retrieveSysInfo(reqSysInfo):
             But I dont want any options to choose from, make the decision and give me the command.
             Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
             Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
+            Don't add any inverted commas either...
         """
     commands = askLLM(prompt)
     commands = commands.split(",")
+    return commands
+
+
+#Ask the user what each of the command does and execute if permitted
+def askAndExec(commands):
+    outputs = []
+    errors = []
+    subprocessResults = {}
+    prompt = f"""
+            You are an Expert in Arch Linux command line interface.
+            Here are a bunch of commands: {",".join(commands)}.
+            Explain in brief what will each of the command do in the system.
+            Use this format: 1. (Command) : (It's job), THREATS: (Only serious threats) or NONE
+            Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
+            Don't try to make your answer too human friendly just follow the format, nothing else.
+        """
+    commandResults = askLLM(prompt)
+    print(commandResults)
+    permission = input("Do you want to execute all these commands? \n [Y/n]: ")
+    if permission == "y" or permission == "Y":
+        print("Granted")
+        print(commands)
+        for command in commands:
+            result = subprocess.run(
+                command.replace("`", "").strip().split(),
+                capture_output=True,
+                text=True
+                )
+            outputs.append(result.stdout)
+            errors.append(result.stderr)
+    else:
+        return
+    subprocessResults["outputs"] = outputs
+    subprocessResults["errors"] = errors
+    return subprocessResults
+
 
 def main():
     try:
@@ -74,5 +113,6 @@ def main():
 
 if __name__  == "__main__":
     reqSysInfo = ["Boot Mode", "RAM", "Network Manager", "nodejs version"]
-    retrieveSysInfo(reqSysInfo)
+    commands = retrieveSysInfo(reqSysInfo)
+    print(askAndExec(commands))
     main() 
