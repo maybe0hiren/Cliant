@@ -1,4 +1,4 @@
-#!/<PATH>/Cliant/env/bin/python
+#!/home/Hiren/Documents/Cache/Cliant/env/bin/python
 
 import os
 from dotenv import load_dotenv
@@ -14,105 +14,183 @@ if not LLM:
 client = genai.Client(api_key=LLM)
 modelName = "models/gemini-2.5-flash"
 
+#Send prompt to LLM and get Result
 def askLLM(prompt):
     response = client.models.generate_content(
         model=modelName,
         contents=prompt,
     )
-    return response.text.strip()    
+    return response.text.strip() 
+
+def handleCommandError(failed_command, error_message):
+    # Ask LLM for corrected command
+    prompt = f"""
+            You are an expert in Arch Linux command line troubleshooting.
+            The following command failed:
+            Command:
+            {failed_command}
+            Error:
+            {error_message}
+            Generate a corrected Arch Linux command that resolves the issue.
+            Rules:
+            - Output ONLY the corrected raw command.
+            - No explanation.
+            - No markdown.
+            - No backticks.
+            - No numbering.
+            - No quotes.
+        """
+    new_command = askLLM(prompt).strip()
+    print("\nSuggested Fix Command:")
+    print(new_command)
+    permission = input("Do you want to execute this corrected command? [Y/n]: ")
+    if permission.lower() != "y":
+        return {
+            "status": "aborted",
+            "command": new_command,
+            "output": None,
+            "error": None
+        }
+    result = subprocess.run(
+        new_command.replace("`", "").strip().split(),
+        capture_output=True,
+        text=True
+    )
+    return {
+        "status": "executed",
+        "command": new_command,
+        "output": result.stdout.strip(),
+        "error": result.stderr.strip()
+    }
+   
 
 #Get relevant system information
 def getReqSysInfo(userMessage):
+    #Get data that we have stored
+    with open("sysInfo.json") as f:
+        data = json.load(f)
+    sysReqDict = {}
     prompt = f"""
-            You are a decent experience user of Arch Linux System.
-            The user wants to execute a task in the CLI.
-            Here is the task {userMessage}
-            Tell me the system information required generate the command to execute the task
-            Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
-            Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
-            If you need info about these, OS, Kernel, CPU Architecture, RAM, Package Manager, Desktop Environmet, Boot Mode... Use these exact words only 
-            Ask for them only if its really necessary
-            If you need any extra info, state that too but dont mention what info is extra.
+            You are an experienced Arch Linux user.
+            A user wants to perform this CLI task:
+            {userMessage}
+            Determine ONLY the minimum system information required to correctly generate the command for this task.
+            Rules:
+            - Return ONLY system information names.
+            - Separate them strictly by commas.
+            - No explanations.
+            - No extra text.
+            - No numbering.
+            - No quotes.
+            - Do not repeat fields already known: {",".join(data.keys())}
+            Example output format:
+            kernel_version,cpu_architecture,installed_packages
         """
     reqSysInfo = askLLM(prompt)
     reqSysInfo = reqSysInfo.split(",")
-    return reqSysInfo
+    for x in reqSysInfo:
+        sysReqDict[x] = [None, None]
+    return sysReqDict
 
 
 #Get the required system info
-def retrieveSysInfo(reqSysInfo):
-    #Retrieve from the saved data
-    sysInfo = {}
+def retrieveSysInfo(sysReqDict):
+    #Get data that we have stored
     with open("sysInfo.json") as f:
         data = json.load(f)
-    for info in reqSysInfo[:]:
-        if info in data:
-            sysInfo[info] = data[info]
-            reqSysInfo.remove(info)
-    
-    #Fetch the remaining info from the system
+    #Fetch a command the required info from the system
     prompt = f"""
-            You are a decent experience user of Arch Linux System.
-            Here's s list of system information I want.
-            {",".join(reqSysInfo)}.
-            Give me all the commands required to fetch this info.
-            If there are multiple commands to retrieve the same info, use the one which generates the least noise.
-            But I dont want any options to choose from, make the decision and give me the command.
-            Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
-            Don't try to make your answer too human friendly just a bunch of system information points separated by commas.
-            Don't add any inverted commas either...
+            You are an expert Arch Linux CLI user.
+            I need terminal commands to retrieve the following system information:
+            {",".join(sysReqDict.keys())}
+            Here are the already known system specs:
+            {str(data)}
+            Rules:
+            - Return ONLY raw terminal commands.
+            - Separate commands strictly by commas.
+            - No explanations.
+            - No markdown.
+            - No backticks.
+            - No numbering.
+            - No quotes.
+            - Choose the cleanest, lowest-noise command for each item.
+            - The order of commands must match the order of requested information.
+            Example output:
+            uname -r,lscpu,pacman -Q
         """
     commands = askLLM(prompt)
     commands = commands.split(",")
-    return commands
+    i = 0
+    for sysReq in sysReqDict:
+        if sysReqDict[sysReq] == [None, None]:
+            sysReqDict[sysReq] = [1, commands[i]]
+            i = i + 1
+    return sysReqDict
 
 
 #Ask the user what each of the command does and execute if permitted
-def askAndExec(commands):
-    outputs = []
-    errors = []
-    subprocessResults = {}
+def askAndExec(sysReqDict):
+    commands = []
+    sysReqs = []
+    for sysReq in sysReqDict:
+        if sysReqDict[sysReq][0] == 1:
+            sysReqs.append(sysReq)
+            commands.append(sysReqDict[sysReq][1])
+    if not commands:
+        return sysReqDict
     prompt = f"""
-            You are an Expert in Arch Linux command line interface.
-            Here are a bunch of commands: {",".join(commands)}.
-            Explain in brief what will each of the command do in the system.
-            Use this format: 1. (Command) : (It's job), THREATS: (Only serious threats) or NONE
-            Don't act like an annoying geek that asks fro a bunch of information just to intimidate a person.
-            Don't try to make your answer too human friendly just follow the format, nothing else.
+            You are an Arch Linux command line expert.
+            These commands will be executed:
+            {",".join(commands)}
+            Explain what each command does.
+            Rules:
+            - Follow this exact format:
+            1. <command> : <short job description>, THREATS: <serious risk or NONE>
+            - No extra commentary.
+            - No markdown.
+            - No advice.
+            - No additional formatting.
+            - Maintain the same order as the commands provided.
+            - Mention only serious risks (data loss, system breakage, privilege escalation).
+            Example:
+            1. uname -r : Displays the current kernel version, THREATS: NONE
         """
     commandResults = askLLM(prompt)
     print(commandResults)
-    permission = input("Do you want to execute all these commands? \n [Y/n]: ")
-    if permission == "y" or permission == "Y":
-        print("Granted")
-        print(commands)
-        for command in commands:
-            result = subprocess.run(
-                command.replace("`", "").strip().split(),
-                capture_output=True,
-                text=True
-                )
-            outputs.append(result.stdout)
-            errors.append(result.stderr)
-    else:
-        return
-    subprocessResults["outputs"] = outputs
-    subprocessResults["errors"] = errors
-    return subprocessResults
+    permission = input("Do you want to execute all these commands? \n [Press Y to execute]: ")
+    
+    if permission.lower() != "y":
+        return sysReqDict
 
+    for i, command in enumerate(commands):
+        result = subprocess.run(
+            command.replace("`", "").strip().split(),
+            capture_output=True,
+            text=True
+        )
+
+        if result.stderr:
+            recovery = handleCommandError(command, result.stderr)
+            print(recovery)
+        else:
+            sysReqDict[sysReqs[i]] = [3, result.stdout.strip()]
+
+    return sysReqDict
 
 def main():
+    sysReqDict = {}
     try:
         while True:
             task = input("> ")
-            command = getReqSysInfo(task)
-            print(command)            
+            sysReqDict = getReqSysInfo(task)
+            print("Analysing the task to gather the required system information...")
+            sysReqDict = retrieveSysInfo(sysReqDict)
+            print("Generating commands to retrieve the required system information...")
+            sysReqDict = askAndExec(sysReqDict)
+            print(sysReqDict)       
     except KeyboardInterrupt:
         print("\nTerminated...")
 
 
 if __name__  == "__main__":
-    reqSysInfo = ["Boot Mode", "RAM", "Network Manager", "nodejs version"]
-    commands = retrieveSysInfo(reqSysInfo)
-    print(askAndExec(commands))
     main() 
