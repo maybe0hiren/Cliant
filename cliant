@@ -5,8 +5,9 @@ from dotenv import load_dotenv
 from google import genai
 import json
 import subprocess
+import traceback
 
-#Code Setup
+# Code Setup
 load_dotenv()
 LLM = os.getenv("GEMINI_KEY")
 if not LLM:
@@ -14,183 +15,280 @@ if not LLM:
 client = genai.Client(api_key=LLM)
 modelName = "models/gemini-2.5-flash"
 
-#Send prompt to LLM and get Result
+# Session-based memory
+SESSION_MEMORY = {
+    "tasks": [],
+    "executed_commands": [],
+    "errors": []
+}
+
+# Session working directory
+SESSION_CWD = os.getcwd()
+
+# Send prompt to LLM and get Result
 def askLLM(prompt):
-    response = client.models.generate_content(
-        model=modelName,
-        contents=prompt,
-    )
-    return response.text.strip() 
+    try:
+        response = client.models.generate_content(
+            model=modelName,
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception as e:
+        SESSION_MEMORY["errors"].append(str(e))
+        return ""
 
-def handleCommandError(failed_command, error_message):
-    # Ask LLM for corrected command
-    prompt = f"""
-            You are an expert in Arch Linux command line troubleshooting.
-            The following command failed:
-            Command:
-            {failed_command}
-            Error:
-            {error_message}
-            Generate a corrected Arch Linux command that resolves the issue.
-            Rules:
-            - Output ONLY the corrected raw command.
-            - No explanation.
-            - No markdown.
-            - No backticks.
-            - No numbering.
-            - No quotes.
-        """
-    new_command = askLLM(prompt).strip()
-    print("\nSuggested Fix Command:")
-    print(new_command)
-    permission = input("Do you want to execute this corrected command? [Y/n]: ")
-    if permission.lower() != "y":
-        return {
-            "status": "aborted",
-            "command": new_command,
-            "output": None,
-            "error": None
-        }
-    result = subprocess.run(
-        new_command.replace("`", "").strip().split(),
-        capture_output=True,
-        text=True
-    )
-    return {
-        "status": "executed",
-        "command": new_command,
-        "output": result.stdout.strip(),
-        "error": result.stderr.strip()
-    }
-   
+# Safety checks for commands
+def isDangerousCommand(cmd):
+    dangerous_patterns = [
+        "rm -rf /",
+        "rm -rf /*",
+        "mkfs",
+        "dd if=",
+        ":(){:|:&};:"
+    ]
+    return any(pat in cmd for pat in dangerous_patterns)
 
-#Get relevant system information
-def getReqSysInfo(userMessage):
-    #Get data that we have stored
-    with open("sysInfo.json") as f:
-        data = json.load(f)
-    sysReqDict = {}
-    prompt = f"""
-            You are an experienced Arch Linux user.
-            A user wants to perform this CLI task:
-            {userMessage}
-            Determine ONLY the minimum system information required to correctly generate the command for this task.
-            Rules:
-            - Return ONLY system information names.
-            - Separate them strictly by commas.
-            - No explanations.
-            - No extra text.
-            - No numbering.
-            - No quotes.
-            - Do not repeat fields already known: {",".join(data.keys())}
-            Example output format:
-            kernel_version,cpu_architecture,installed_packages
-        """
-    reqSysInfo = askLLM(prompt)
-    reqSysInfo = reqSysInfo.split(",")
-    for x in reqSysInfo:
-        sysReqDict[x] = [None, None]
-    return sysReqDict
+def requires_extra_confirmation(cmd):
+    risky_keywords = ["rm ", "mv ", "cp ", "chmod ", "chown "]
+    return any(cmd.strip().startswith(k) for k in risky_keywords)
 
+# Safe command execution wrapper (DIRECTORY-AWARE)
+def safeRunCommand(command):
+    global SESSION_CWD
+    try:
+        cmd = command.replace("`", "").strip()
 
-#Get the required system info
-def retrieveSysInfo(sysReqDict):
-    #Get data that we have stored
-    with open("sysInfo.json") as f:
-        data = json.load(f)
-    #Fetch a command the required info from the system
-    prompt = f"""
-            You are an expert Arch Linux CLI user.
-            I need terminal commands to retrieve the following system information:
-            {",".join(sysReqDict.keys())}
-            Here are the already known system specs:
-            {str(data)}
-            Rules:
-            - Return ONLY raw terminal commands.
-            - Separate commands strictly by commas.
-            - No explanations.
-            - No markdown.
-            - No backticks.
-            - No numbering.
-            - No quotes.
-            - Choose the cleanest, lowest-noise command for each item.
-            - The order of commands must match the order of requested information.
-            Example output:
-            uname -r,lscpu,pacman -Q
-        """
-    commands = askLLM(prompt)
-    commands = commands.split(",")
-    i = 0
-    for sysReq in sysReqDict:
-        if sysReqDict[sysReq] == [None, None]:
-            sysReqDict[sysReq] = [1, commands[i]]
-            i = i + 1
-    return sysReqDict
+        # Handle directory navigation
+        if cmd.startswith("cd "):
+            target = cmd[3:].strip()
+            new_path = os.path.abspath(os.path.join(SESSION_CWD, target))
+            if os.path.isdir(new_path):
+                SESSION_CWD = new_path
+                return f"Changed directory to {SESSION_CWD}", ""
+            return "", f"Directory does not exist: {target}"
 
+        if isDangerousCommand(cmd):
+            return "", "Blocked dangerous command"
 
-#Ask the user what each of the command does and execute if permitted
-def askAndExec(sysReqDict):
-    commands = []
-    sysReqs = []
-    for sysReq in sysReqDict:
-        if sysReqDict[sysReq][0] == 1:
-            sysReqs.append(sysReq)
-            commands.append(sysReqDict[sysReq][1])
-    if not commands:
-        return sysReqDict
-    prompt = f"""
-            You are an Arch Linux command line expert.
-            These commands will be executed:
-            {",".join(commands)}
-            Explain what each command does.
-            Rules:
-            - Follow this exact format:
-            1. <command> : <short job description>, THREATS: <serious risk or NONE>
-            - No extra commentary.
-            - No markdown.
-            - No advice.
-            - No additional formatting.
-            - Maintain the same order as the commands provided.
-            - Mention only serious risks (data loss, system breakage, privilege escalation).
-            Example:
-            1. uname -r : Displays the current kernel version, THREATS: NONE
-        """
-    commandResults = askLLM(prompt)
-    print(commandResults)
-    permission = input("Do you want to execute all these commands? \n [Press Y to execute]: ")
-    
-    if permission.lower() != "y":
-        return sysReqDict
+        use_shell = any(x in cmd for x in ["|", "&&", "||", ">", "<"])
 
-    for i, command in enumerate(commands):
         result = subprocess.run(
-            command.replace("`", "").strip().split(),
+            cmd if use_shell else cmd.split(),
+            shell=use_shell,
+            executable="/bin/bash" if use_shell else None,
             capture_output=True,
-            text=True
+            text=True,
+            timeout=30,
+            cwd=SESSION_CWD
         )
 
-        if result.stderr:
-            recovery = handleCommandError(command, result.stderr)
-            print(recovery)
-        else:
-            sysReqDict[sysReqs[i]] = [3, result.stdout.strip()]
+        return result.stdout.strip(), result.stderr.strip()
+
+    except subprocess.TimeoutExpired:
+        return "", "Command timed out"
+    except Exception as e:
+        return "", str(e)
+
+# Error recovery handler
+def handleCommandError(failed_command, error_message):
+    prompt = f"""
+                You are an expert Arch Linux troubleshooter.
+
+                System policy:
+                - Assume the system is already set up and functional.
+                - DO NOT suggest installing packages.
+                - DO NOT suggest downloading anything.
+                - DO NOT suggest enabling services.
+
+                Command:
+                {failed_command}
+
+                Error:
+                {error_message}
+
+                Session context:
+                {SESSION_MEMORY["executed_commands"]}
+
+                Return ONLY a corrected raw command.
+                NO explanation.
+                NO markdown.
+                NO backticks.
+            """
+
+    new_command = askLLM(prompt).strip()
+    if not new_command or isDangerousCommand(new_command):
+        return
+
+    if input(f"Execute fix `{new_command}` ? [Y/n]: ").lower() != "y":
+        return
+
+    stdout, stderr = safeRunCommand(new_command)
+    SESSION_MEMORY["executed_commands"].append(new_command)
+    if stderr:
+        SESSION_MEMORY["errors"].append(stderr)
+
+# Get relevant system information
+def getReqSysInfo(userMessage):
+    with open("sysInfo.json") as f:
+        data = json.load(f)
+
+    prompt = f"""
+            User task:
+            {userMessage}
+
+            Return ONLY required system info names.
+            Comma-separated.
+            NO explanation.
+            Skip known: {",".join(data.keys())}
+            """
+
+    reqSysInfo = askLLM(prompt).split(",")
+    return {x.strip(): [None, None] for x in reqSysInfo if x.strip()}
+
+# Get the required system info
+def retrieveSysInfo(sysReqDict):
+    with open("sysInfo.json") as f:
+        data = json.load(f)
+
+    prompt = f"""
+            System info needed:
+            {",".join(sysReqDict.keys())}
+
+            Known:
+            {data}
+
+            Return ONLY commands.
+            Comma-separated.
+            NO explanation.
+            NO markdown.
+        """
+
+    commands = askLLM(prompt).split(",")
+
+    i = 0
+    for key in sysReqDict:
+        if sysReqDict[key] == [None, None] and i < len(commands):
+            sysReqDict[key] = [1, commands[i].strip()]
+            i += 1
 
     return sysReqDict
 
+# Ask the user what each command does and execute if permitted
+def askAndExec(sysReqDict):
+    commands, keys = [], []
+    for k in sysReqDict:
+        if sysReqDict[k][0] == 1:
+            keys.append(k)
+            commands.append(sysReqDict[k][1])
+
+    if not commands:
+        return sysReqDict
+
+    print(askLLM(f"""
+            Explain each command briefly.
+            Format ONLY:
+            <command> : <job>, THREATS: <NONE or serious>
+
+            Commands:
+            {",".join(commands)}
+        """))
+
+    if input("Execute? [Y/n]: ").lower() != "y":
+        return sysReqDict
+
+    for i, cmd in enumerate(commands):
+        out, err = safeRunCommand(cmd)
+        SESSION_MEMORY["executed_commands"].append(cmd)
+        if err:
+            SESSION_MEMORY["errors"].append(err)
+            handleCommandError(cmd, err)
+        else:
+            sysReqDict[keys[i]] = [3, out]
+
+    return sysReqDict
+
+# Generate task execution commands (FORCED EXECUTION)
+def generateTaskCommands(task, sysReqDict):
+    prompt = f"""
+            You are an Arch Linux runtime command executor.
+
+            System policy:
+            - Assume the system is already set up and functional.
+            - DO NOT suggest installing packages.
+            - DO NOT suggest downloading anything.
+            - DO NOT suggest enabling services.
+            - Treat this as a runtime action, not setup.
+
+            IMPORTANT:
+            - You MUST generate at least one command.
+            - Returning an empty response is NOT allowed.
+            - The task MUST be executed.
+
+            Task:
+            {task}
+
+            CWD:
+            {SESSION_CWD}
+
+            History:
+            {SESSION_MEMORY["executed_commands"]}
+
+            Return ONLY raw commands.
+            Comma-separated.
+            NO explanation.
+        """
+
+    response = askLLM(prompt).strip()
+    if not response:
+        SESSION_MEMORY["errors"].append("LLM returned empty command set")
+        return []
+
+    return [c.strip() for c in response.split(",") if c.strip()]
+
+# Execute task commands
+def executeTaskCommands(taskCommands):
+    if not taskCommands:
+        print("No executable commands generated.")
+        return
+
+    print(askLLM(f"""
+            Explain commands briefly.
+            Format ONLY:
+            <command> : <job>, THREATS: <NONE or serious>
+
+            Commands:
+            {",".join(taskCommands)}
+        """))
+
+    if input("Execute? [Y/n]: ").lower() != "y":
+        return
+
+    for cmd in taskCommands:
+        out, err = safeRunCommand(cmd)
+        SESSION_MEMORY["executed_commands"].append(cmd)
+        if err:
+            SESSION_MEMORY["errors"].append(err)
+            handleCommandError(cmd, err)
+        else:
+            print(out)
+
+# Main loop
 def main():
-    sysReqDict = {}
+    print("CLIANT session started.")
     try:
         while True:
             task = input("> ")
+            SESSION_MEMORY["tasks"].append(task)
+
             sysReqDict = getReqSysInfo(task)
-            print("Analysing the task to gather the required system information...")
             sysReqDict = retrieveSysInfo(sysReqDict)
-            print("Generating commands to retrieve the required system information...")
             sysReqDict = askAndExec(sysReqDict)
-            print(sysReqDict)       
+
+            cmds = generateTaskCommands(task, sysReqDict)
+            executeTaskCommands(cmds)
+
     except KeyboardInterrupt:
-        print("\nTerminated...")
+        print("\nSession terminated safely.")
 
-
-if __name__  == "__main__":
-    main() 
+if __name__ == "__main__":
+    main()
