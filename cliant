@@ -4,6 +4,10 @@ import os
 import json
 import subprocess
 import traceback
+import threading
+import uuid
+import time
+import re
 from dotenv import load_dotenv
 from google import genai
 
@@ -19,15 +23,121 @@ modelName = "models/gemini-2.5-flash"
 userId = os.getlogin()
 profileDb = "userCommandProfiles.json"
 
-sessionMemory = {
-    "tasks": [],
-    "executedCommands": [],
-    "errors": [],
-    "fixAttempts": {}
-}
 
+SESSION_MEMORY_FILE = "sessionMemory.json"
+
+def loadSessionMemory():
+    if os.path.exists(SESSION_MEMORY_FILE):
+        try:
+            with open(SESSION_MEMORY_FILE, "r") as f:
+                data = json.load(f)
+            data.setdefault("tasks", [])
+            data.setdefault("executedCommands", [])
+            data.setdefault("errors", [])
+            data.setdefault("fixAttempts", {})
+            return data
+        except Exception:
+            pass
+    return {
+        "tasks": [],
+        "executedCommands": [],
+        "errors": [],
+        "fixAttempts": {}
+    }
+
+def saveSessionMemory():
+    try:
+        with open(SESSION_MEMORY_FILE, "w") as f:
+            json.dump(sessionMemory, f, indent=2)
+    except Exception:
+        pass
+
+sessionMemory = loadSessionMemory()
 sessionCwd = os.getcwd()
 
+DRY_RUN = False 
+
+def isDryRun():
+    return DRY_RUN
+_taskRegistryLock = threading.Lock()
+_taskRegistry = {}  
+
+def _backgroundWorker(task_id, command):
+    with _taskRegistryLock:
+        _taskRegistry[task_id]["status"] = "running"
+        _taskRegistry[task_id]["started_at"] = time.strftime("%H:%M:%S")
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+            cwd=sessionCwd
+        )
+        with _taskRegistryLock:
+            _taskRegistry[task_id]["stdout"] = result.stdout.strip()
+            _taskRegistry[task_id]["stderr"] = result.stderr.strip()
+            _taskRegistry[task_id]["status"] = "failed" if result.stderr.strip() else "completed"
+    except Exception as e:
+        with _taskRegistryLock:
+            _taskRegistry[task_id]["stderr"] = str(e)
+            _taskRegistry[task_id]["status"] = "failed"
+    finally:
+        with _taskRegistryLock:
+            _taskRegistry[task_id]["ended_at"] = time.strftime("%H:%M:%S")
+
+
+def runInBackground(command):
+    task_id = str(uuid.uuid4())[:8]
+    with _taskRegistryLock:
+        _taskRegistry[task_id] = {
+            "status": "queued",
+            "command": command,
+            "stdout": "",
+            "stderr": "",
+            "started_at": None,
+            "ended_at": None
+        }
+    t = threading.Thread(target=_backgroundWorker, args=(task_id, command), daemon=True)
+    t.start()
+    return task_id
+
+
+def showRunningTasks():
+    with _taskRegistryLock:
+        tasks = {k: v for k, v in _taskRegistry.items() if v["status"] in ("queued", "running")}
+    if not tasks:
+        print("No running tasks.")
+        return
+    for tid, info in tasks.items():
+        print(f"  [{tid}] {info['status'].upper():10} | started: {info['started_at']} | cmd: {info['command']}")
+
+
+def showCompletedTasks():
+    with _taskRegistryLock:
+        tasks = {k: v for k, v in _taskRegistry.items() if v["status"] in ("completed", "failed")}
+    if not tasks:
+        print("No completed tasks.")
+        return
+    for tid, info in tasks.items():
+        status_label = "✔" if info["status"] == "completed" else "✘"
+        print(f"  {status_label} [{tid}] {info['status'].upper():10} | ended: {info['ended_at']} | cmd: {info['command']}")
+        if info["stdout"]:
+            print(f"      stdout: {info['stdout'][:120]}")
+        if info["stderr"]:
+            print(f"      stderr: {info['stderr'][:120]}")
+
+
+def isLongRunningCommand(cmd):
+    long_running_patterns = [
+        r"\bwget\b", r"\bcurl\b.*-O", r"\brsync\b", r"\btar\b",
+        r"\bffmpeg\b", r"\bmake\b", r"\bcmake\b", r"\bgit clone\b",
+        r"\bapt\b", r"\bpacman\b", r"\byay\b", r"\bpip install\b",
+        r"\bsleep\b \d{2,}", r"\bwatch\b", r"\btop\b", r"\bhtop\b"
+    ]
+    return any(re.search(p, cmd) for p in long_running_patterns)
 
 def askLLM(prompt, retries=2):
     for _ in range(retries + 1):
@@ -72,18 +182,72 @@ def getFrequentCommands(limit=5):
     user = profiles.get(userId, {})
     return sorted(user, key=user.get, reverse=True)[:limit]
 
+_HIGH_RISK_PATTERNS = [
+    r"rm\s+-rf\s+/",
+    r"rm\s+-rf\s+\*",
+    r"\bmkfs\b",
+    r"\bdd\b.*if=",
+    r":\(\)\{:\|:&\};:",
+    r"\bshred\b",
+    r"\bfdisk\b",
+    r"\bparted\b",
+    r">\s*/dev/sd",
+    r">\s*/dev/nvme",
+    r"\bsystemctl\s+disable\b",
+    r"\bkill\s+-9\s+1\b",
+    r"\bchmod\s+777\s+/",
+    r"\bsudo\s+rm\b",
+]
+
+_MEDIUM_RISK_PATTERNS = [
+    r"\brm\b",
+    r"\bmv\b",
+    r"\bcp\b",
+    r"\bchmod\b",
+    r"\bchown\b",
+    r"\bsystemctl\b",
+    r"\bservice\b",
+    r"\bkill\b",
+    r"\bsudo\b",
+]
+
+def getRiskLevel(cmd):
+    for p in _HIGH_RISK_PATTERNS:
+        if re.search(p, cmd):
+            return "high"
+    for p in _MEDIUM_RISK_PATTERNS:
+        if re.search(p, cmd):
+            return "medium"
+    return "safe"
+
 
 def isDangerousCommand(cmd):
-    return any(p in cmd for p in [
-        "rm -rf /", "rm -rf /*", "mkfs", "dd if=", ":(){:|:&};:"
-    ])
+    return getRiskLevel(cmd) == "high"
 
 
 def requiresExtraConfirmation(cmd):
-    return cmd.strip().startswith(
-        ("rm ", "mv ", "cp ", "chmod ", "chown ")
-    )
+    return getRiskLevel(cmd) in ("medium", "high")
 
+
+def confirmCommand(cmd):
+    risk = getRiskLevel(cmd)
+
+    if risk == "safe":
+        return True
+
+    if risk == "medium":
+        ans = input(f"⚠️  Medium-risk command: `{cmd}`\n   Execute? [Y/n]: ").strip().lower()
+        return ans != "n"
+
+    if risk == "high":
+        print(f"🚨 HIGH-RISK command detected: `{cmd}`")
+        first = input("   First confirmation — are you sure? [Y/n]: ").strip().lower()
+        if first == "n":
+            return False
+        second = input("   Second confirmation — REALLY execute? [Y/n]: ").strip().lower()
+        return second != "n"
+
+    return False
 
 def safeRunCommand(command):
     global sessionCwd
@@ -99,6 +263,18 @@ def safeRunCommand(command):
 
         if isDangerousCommand(cmd):
             return "", "Blocked dangerous command", "error"
+
+
+        if isDryRun():
+            print(f"[DRY-RUN] Would execute: {cmd}")
+            return f"(dry-run) {cmd}", "", "ok"
+
+        if isLongRunningCommand(cmd):
+            ans = input(f"⏳ `{cmd}` looks long-running. Run in background? [Y/n]: ").strip().lower()
+            if ans != "n":
+                task_id = runInBackground(cmd)
+                print(f"🔄 Background task started — ID: {task_id}")
+                return f"(background) task_id={task_id}", "", "ok"
 
         useShell = any(x in cmd for x in ["|", "&&", "||", ">", "<"])
 
@@ -160,18 +336,39 @@ def collectSystemInfo(task, error):
 
     return info
 
+MAX_FIX_ATTEMPTS = 3
 
 def handleCommandError(task, cmd, err):
     attempts = sessionMemory["fixAttempts"].get(cmd, 0)
-    if attempts >= 1:
-        print("❌ Auto-fix failed. Manual intervention required.")
+
+    if attempts >= MAX_FIX_ATTEMPTS:
+        print("❌ Max auto-fix attempts reached. Manual intervention required.")
         return
 
     sessionMemory["fixAttempts"][cmd] = attempts + 1
+    sessionMemory["errors"].append({"cmd": cmd, "err": err, "attempt": attempts + 1})
+    saveSessionMemory()
 
     sysInfo = collectSystemInfo(task, err)
 
-    fix = askLLM(f"""
+    if attempts + 1 == MAX_FIX_ATTEMPTS:
+        fix_prompt = f"""
+                    You are an Arch Linux expert.
+                    All previous fixes failed for this task. Suggest a COMPLETELY DIFFERENT approach.
+                    Task:
+                    {task}
+                    Failed command:
+                    {cmd}
+                    Error:
+                    {err}
+                    System info:
+                    {sysInfo}
+                    Previous fix attempts:
+                    {attempts}
+                    Return ONLY the corrected command using a different strategy.
+                """
+    else:
+        fix_prompt = f"""
                     You are an Arch Linux expert.
                     Task:
                     {task}
@@ -182,24 +379,154 @@ def handleCommandError(task, cmd, err):
                     System info:
                     {sysInfo}
                     Return ONLY corrected command.
-                """)
+                """
+
+    fix = askLLM(fix_prompt)
 
     if not fix or isDangerousCommand(fix):
+        print("⚠️  LLM could not suggest a safe fix.")
         return
 
-    print(f"Suggested fix: {fix}")
-    if input("Execute fix? [Y/n]: ").lower() != "y":
+    print(f"💡 Suggested fix (attempt {attempts + 1}/{MAX_FIX_ATTEMPTS}): {fix}")
+    if not confirmCommand(fix):
+        print("Fix skipped by user.")
         return
 
-    out, _, status = safeRunCommand(fix)
+    out, new_err, status = safeRunCommand(fix)
     sessionMemory["executedCommands"].append(fix)
+    saveSessionMemory()
 
     if status == "ok":
         print(out)
         recordCommandUsage(fix)
+    elif status == "error":
+        print(f"⚠️  Fix also failed: {new_err}")
+        # Recurse for next attempt
+        handleCommandError(task, fix, new_err)
+
+LOCAL_MAPPING_FILE = "localCommandMappings.json"
+
+_STATIC_LOCAL_MAP = {
+    "list files": "ls -la",
+    "show current directory": "pwd",
+    "disk usage": "df -h",
+    "memory usage": "free -h",
+    "running processes": "ps aux",
+    "who is logged in": "who",
+    "system uptime": "uptime",
+    "kernel version": "uname -r",
+    "cpu info": "lscpu",
+    "network interfaces": "ip a",
+    "show ip address": "ip addr show",
+    "top processes": "top -bn1 | head -20",
+    "show environment variables": "env",
+    "show path": "echo $PATH",
+    "date and time": "date",
+    "calendar": "cal",
+    "show open ports": "ss -tuln",
+    "show routes": "ip route",
+}
+
+
+def loadLocalMappings():
+    if not os.path.exists(LOCAL_MAPPING_FILE):
+        return {}
+    try:
+        with open(LOCAL_MAPPING_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def saveLocalMapping(task, commands):
+    mappings = loadLocalMappings()
+    mappings[task.lower().strip()] = commands
+    try:
+        with open(LOCAL_MAPPING_FILE, "w") as f:
+            json.dump(mappings, f, indent=2)
+    except Exception:
+        pass
+
+
+def lookupLocalMapping(task):
+    key = task.lower().strip()
+
+    if key in _STATIC_LOCAL_MAP:
+        return [_STATIC_LOCAL_MAP[key]]
+
+    for static_key, cmd in _STATIC_LOCAL_MAP.items():
+        if static_key in key or key in static_key:
+            return [cmd]
+
+    learned = loadLocalMappings()
+    if key in learned:
+        return learned[key]
+
+    return None
+
+
+def isSimpleTask(task):
+    words = task.strip().split()
+    conjunctions = {"and", "then", "after", "also", "next", "finally", "first"}
+    return len(words) <= 6 and not any(w.lower() in conjunctions for w in words)
+
+def planTask(task):
+
+    words = task.strip().split()
+    conjunctions = {"and", "then", "after", "also", "next", "finally", "first", "before"}
+    is_complex = len(words) > 7 or any(w.lower() in conjunctions for w in words)
+
+    if not is_complex:
+        return None
+
+    raw = askLLM(f"""
+                    You are a Linux task planner.
+                    Break this task into clear sequential steps.
+                    Format: return ONLY numbered steps like:
+                    1. <step description>
+                    2. <step description>
+                    3. <step description>
+                    Task: {task}
+                    CWD: {sessionCwd}
+                    Keep it under 6 steps. Be concise.
+                """)
+
+    if not raw:
+        return None
+
+    steps = []
+    for line in raw.splitlines():
+        line = line.strip()
+        m = re.match(r"^(?:step\s*)?\d+[.):\-]\s*(.+)$", line, re.IGNORECASE)
+        if m:
+            steps.append(m.group(1).strip())
+
+    return steps if len(steps) > 1 else None
+
+
+def executeMultiStepTask(task, steps):
+
+    print(f"\n📋 Task Plan ({len(steps)} steps):")
+    for i, step in enumerate(steps, 1):
+        print(f"   {i}. {step}")
+
+    if input("\nProceed with this plan? [Y/n]: ").strip().lower() == "n":
+        return
+
+    for i, step in enumerate(steps, 1):
+        print(f"\n▶ Step {i}/{len(steps)}: {step}")
+        cmds = generateTaskCommands(step)
+        executeTaskCommands(step, cmds)
 
 
 def generateTaskCommands(task):
+
+    local_cmds = lookupLocalMapping(task)
+    if local_cmds and isSimpleTask(task):
+        print(f"⚡ Using local mapping for: '{task}'")
+        return local_cmds
+
+
     frequent = getFrequentCommands()
 
     raw = askLLM(f"""
@@ -218,7 +545,8 @@ def generateTaskCommands(task):
     cmds = normalizeCommands(raw)
     if not cmds:
         raise RuntimeError("LLM failed to generate commands")
-
+    if isSimpleTask(task):
+        saveLocalMapping(task, cmds)
     return cmds
 
 
@@ -235,12 +563,13 @@ def executeTaskCommands(task, cmds):
         return
 
     for cmd in cmds:
-        if requiresExtraConfirmation(cmd):
-            if input(f"Extra confirmation for `{cmd}` [Y/n]: ").lower() != "y":
-                continue
+        if not confirmCommand(cmd):
+            print(f"Skipped: {cmd}")
+            continue
 
         out, err, status = safeRunCommand(cmd)
         sessionMemory["executedCommands"].append(cmd)
+        saveSessionMemory()
 
         if status == "ok":
             print(out)
@@ -248,25 +577,91 @@ def executeTaskCommands(task, cmds):
         elif status == "error":
             handleCommandError(task, cmd, err)
 
+def handleMetaCommand(task):
+    global DRY_RUN
+
+    t = task.strip().lower()
+
+    if t in ("show running tasks", "running tasks", "tasks running"):
+        showRunningTasks()
+        return True
+
+    if t in ("show completed tasks", "completed tasks", "tasks done", "show done tasks"):
+        showCompletedTasks()
+        return True
+
+    if t in ("dry-run on", "enable dry-run", "dryrun on"):
+        DRY_RUN = True
+        print("🧪 Dry-run mode ENABLED. Commands will be simulated.")
+        return True
+
+    if t in ("dry-run off", "disable dry-run", "dryrun off"):
+        DRY_RUN = False
+        print("✅ Dry-run mode DISABLED. Commands will execute normally.")
+        return True
+
+    if t in ("show session", "session memory", "show memory"):
+        print(json.dumps({
+            k: v for k, v in sessionMemory.items() if k != "fixAttempts"
+        }, indent=2))
+        return True
+
+    if t in ("clear session", "reset session"):
+        sessionMemory["tasks"].clear()
+        sessionMemory["executedCommands"].clear()
+        sessionMemory["errors"].clear()
+        sessionMemory["fixAttempts"].clear()
+        saveSessionMemory()
+        print("🗑️  Session memory cleared.")
+        return True
+
+    if t in ("help", "?", "commands"):
+        print("""
+Built-in commands:
+  show running tasks     — list background tasks in progress
+  show completed tasks   — list finished/failed background tasks
+  dry-run on / off       — toggle dry-run mode
+  show session           — dump session memory
+  clear session          — wipe session memory
+  help                   — show this menu
+        """)
+        return True
+
+    return False
+
 
 def main():
     print("CLIANT session started.")
+    if DRY_RUN:
+        print("🧪 Dry-run mode is active.")
     try:
         while True:
             task = input("> ").strip()
             if not task:
                 continue
 
+            if handleMetaCommand(task):
+                continue
+
             sessionMemory["tasks"].append(task)
+            saveSessionMemory()
+
+            steps = planTask(task)
+            if steps:
+                executeMultiStepTask(task, steps)
+                continue
+
 
             cmds = generateTaskCommands(task)
             executeTaskCommands(task, cmds)
 
     except KeyboardInterrupt:
         print("\nSession terminated safely.")
+        saveSessionMemory()
     except Exception as e:
         print("❌", e)
         traceback.print_exc()
+        saveSessionMemory()
 
 
 if __name__ == "__main__":
