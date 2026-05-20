@@ -9,7 +9,6 @@ import threading
 import uuid
 import time
 import re
-from dotenv import load_dotenv
 import ollama
 
 HOME_DIR = os.path.expanduser("~")
