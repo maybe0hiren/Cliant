@@ -1,6 +1,7 @@
 #!/home/Hiren/Documents/Cache/Cliant/env/bin/python
 
 import os
+import sys
 import json
 import subprocess
 import traceback
@@ -9,22 +10,41 @@ import uuid
 import time
 import re
 from dotenv import load_dotenv
-from google import genai
+import ollama
 
-
-load_dotenv()
-llmKey = os.getenv("GEMINI_KEY")
-if not llmKey:
-    raise RuntimeError("LLM not reachable")
-
-client = genai.Client(api_key=llmKey)
-modelName = "models/gemini-2.5-flash"
-
+HOME_DIR = os.path.expanduser("~")
+DATA_DIR = os.path.join(
+    HOME_DIR,
+    ".local",
+    "share",
+    "cliant"
+)
+os.makedirs(DATA_DIR, exist_ok=True)
 userId = os.getlogin()
-profileDb = "userCommandProfiles.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+profileDb = os.path.join(
+    DATA_DIR,
+    "userCommandProfiles.json"
+)
+
+SESSION_MEMORY_FILE = os.path.join(
+    DATA_DIR,
+    "sessionMemory.json"
+)
+
+LOCAL_MAPPING_FILE = os.path.join(
+    DATA_DIR,
+    "localCommandMappings.json"
+)
 
 
-SESSION_MEMORY_FILE = "sessionMemory.json"
+def get_resource_path(filename):
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, filename)  # PyInstaller temp dir
+    return os.path.join(os.getcwd(), filename)  # normal run
+
+def get_data_path(filename):
+    return os.path.join(os.getcwd(), filename)  # writable
 
 def loadSessionMemory():
     if os.path.exists(SESSION_MEMORY_FILE):
@@ -140,17 +160,42 @@ def isLongRunningCommand(cmd):
     return any(re.search(p, cmd) for p in long_running_patterns)
 
 def askLLM(prompt, retries=2):
+    systemPrompt = """
+You are CLIANT, an Arch Linux terminal AI assistant.
+
+Rules:
+- Return concise outputs
+- Return ONLY executable commands when asked for commands
+- No markdown
+- No explanations unless explicitly requested
+- Prefer Arch Linux tools
+- Avoid dangerous commands
+"""
+
     for _ in range(retries + 1):
         try:
-            r = client.models.generate_content(
-                model=modelName,
-                contents=prompt
+            r = ollama.chat(
+                model="qwen2.5:3b",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": systemPrompt
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
             )
-            text = (r.text or "").strip()
+
+            text = r["message"]["content"].strip()
+
             if text:
                 return text
+
         except Exception as e:
             sessionMemory["errors"].append(str(e))
+
     return ""
 
 
@@ -302,19 +347,34 @@ def safeRunCommand(command):
 
 
 def collectSystemInfo(task, error):
-    with open("sysInfo.json") as f:
-        known = json.load(f)
+
+    known = {}
+
+    try:
+        sysinfo_path = get_resource_path("sysInfo.json")
+
+        if os.path.exists(sysinfo_path):
+            with open(sysinfo_path, "r") as f:
+                known = json.load(f)
+
+    except Exception as e:
+        sessionMemory["errors"].append(
+            f"sysInfo load failed: {e}"
+        )
 
     req = askLLM(f"""
                     Task:
                     {task}
+
                     Command error:
                     {error}
+
                     Known system info:
-                    {",".join(known.keys())}
+                    {",".join(known.keys()) if known else "None"}
+
                     Return ONLY missing system info names.
                     Comma-separated.
-                """)
+                    """)
 
     reqKeys = normalizeCommands(req)
     if not reqKeys:
@@ -403,8 +463,6 @@ def handleCommandError(task, cmd, err):
         print(f"⚠️  Fix also failed: {new_err}")
         # Recurse for next attempt
         handleCommandError(task, fix, new_err)
-
-LOCAL_MAPPING_FILE = "localCommandMappings.json"
 
 _STATIC_LOCAL_MAP = {
     "list files": "ls -la",
@@ -637,6 +695,25 @@ def main():
     try:
         while True:
             task = input("> ").strip()
+            if task.startswith("::"):
+                raw_cmd = task[2:].strip()
+                if not raw_cmd:
+                    print("No command provided.")
+                    continue
+                print(f"⚡ Direct execution: {raw_cmd}")
+                if not confirmCommand(raw_cmd):
+                    print("Command cancelled.")
+                    continue
+                out, err, status = safeRunCommand(raw_cmd)
+                sessionMemory["executedCommands"].append(raw_cmd)
+                saveSessionMemory()
+                if out:
+                    print(out)
+                if err:
+                    print(err)
+                continue
+
+            
             if not task:
                 continue
 
